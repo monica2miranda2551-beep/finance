@@ -339,12 +339,13 @@
 <script>
 // ─── FIREBASE ──────────────────────────────────────────────────
 firebase.initializeApp({
-  apiKey:"AIzaSyBSl4xPUb-WgW1lzxuyWOkwJC1KBvbW1Oc",
-  authDomain:"financecontrol-e98fd.firebaseapp.com",
-  projectId:"financecontrol-e98fd",
-  storageBucket:"financecontrol-e98fd.firebasestorage.app",
-  messagingSenderId:"1006631835866",
-  appId:"1:1006631835866:web:514665bc5ad8debf226de3"
+  apiKey:"AIzaSyCuTqXAk1yQ0AMS9WRkeI8YmTfEh4kMKiM",
+  authDomain:"financecontrolfamilia.firebaseapp.com",
+  projectId:"financecontrolfamilia",
+  storageBucket:"financecontrolfamilia.firebasestorage.app",
+  messagingSenderId:"402855440567",
+  appId:"1:402855440567:web:9e13eedf9b6cce44addd32",
+  measurementId:"G-6LJ0RQ7QCE"
 });
 const db=firebase.firestore();
 let familyCode=null, fbUnsub=null;
@@ -396,6 +397,7 @@ let CATS = [
   {id:'compras',      name:'Compras',      color:'#EC4899'},
   {id:'assinaturas',  name:'Assinaturas',  color:'#6366F1'},
   {id:'educacao',     name:'Educação',     color:'#84CC16'},
+  {id:'sallie',       name:'Sallie Mae',   color:'#7C3AED'},
   {id:'zelle',        name:'Zelle',        color:'#F97316'},
   {id:'cartao',       name:'Pag. Cartão',  color:'#64748B'},
   {id:'outros',       name:'Outros',       color:'#9CA3AF'},
@@ -411,6 +413,7 @@ const KW = {
   compras:['amazon','mercado livre','mercadolivre','americanas','magazine luiza','magalu','shopee','shein','zara','renner','riachuelo','c&a ','centauro','hering','tok stok','tok&stok','casas bahia','leroy merlin','hm ','h&m','aliexpress','submarino','netshoes','dafiti','nike','adidas','puma','decathlon','kabum','pichau','target','best buy','costco','macy','nordstrom','tj maxx','gap ','uniqlo','apple store','usps','fedex','ups ','shipping'],
   assinaturas:['microsoft','adobe','dropbox','icloud','google one','google storage','apple.com','office 365','github','digitalocean','aws','heroku','notion','figma','canva','duolingo','hotmart','assinatura','subscription','chatgpt','openai'],
   educacao:['escola','colegio','faculdade','universidade','alura','udemy','coursera','linkedin learning','livro','curso','treinamento','workshop','apostila','material escolar','papelaria','saraiva','cultura ','kaplan','wizard','ccaa','bus campus group','tuition'],
+  sallie:['sallie mae','salliemae','navient','student loan payment'],
   zelle:['zelle payment to','zelle to '],
   cartao:['payment to crd','mobile banking payment','online scheduled payment to acct'],
   outros:['uscis','tax paymnt','dtf pit','international transaction fee','transaction fee','withdrwl','cashreward','bkofamerica','bank of america'],
@@ -443,19 +446,16 @@ function cleanDesc(desc, cat){
 
 // ─── INCOME CATEGORIES ─────────────────────────────────────────
 const INCOME_CATS=[
-  {id:'salario',   name:'Salário TA',      color:'#10B981'},
-  {id:'estagio',   name:'Estágio',         color:'#3B82F6'},
-  {id:'loan',      name:'Student Loan',    color:'#8B5CF6'},
+  {id:'salario',   name:'Salário',         color:'#10B981'},
+  {id:'wise',      name:'Wise Transfer',   color:'#3B82F6'},
   {id:'zelle_in',  name:'Zelle Recebido',  color:'#F59E0B'},
   {id:'outros_in', name:'Outros',          color:'#94A3B8'},
 ];
 function incomeCatById(id){return INCOME_CATS.find(c=>c.id===id)||INCOME_CATS[INCOME_CATS.length-1]}
 function classifyIncome(desc){
   const d=(desc||'').toLowerCase();
-  if(d.includes('payroll')&&d.includes('columbia'))return 'salario';
-  if(d.includes('payroll')&&d.includes('proladex'))return 'estagio';
-  if(d.includes('payroll'))return 'salario';
-  if(d.includes('direct pay'))return 'loan';
+  if(d.includes('payroll')||d.includes('direct deposit')||d.includes('salary'))return 'salario';
+  if(d.includes('wise')||d.includes('transferwise'))return 'wise';
   if(d.includes('zelle payment from'))return 'zelle_in';
   return 'outros_in';
 }
@@ -940,7 +940,7 @@ function renderSourceFilter(){
   const bar=document.getElementById('source-filter-bar');
   if(sources.length<=1){bar.classList.add('hidden');return;}
   bar.classList.remove('hidden');
-  const cardNames={'card_2413':'💳 Helio','card_7299':'💳 Malu'};
+  const cardNames={'card_1463':'💳 Moni (Amex)','card_3375':'💳 Moni (BofA)','card_1531':'💳 Moni (Cap One)','card_5485':'💳 Moni (BofA)','card_8220':'💳 Moni (BofA Sign)','card_3413':'💳 Moni (Amazon)','card_0560':'💳 Moni (Affirm)','card_4659':'🏦 Moni (BofA Checking)'};
   function sourceLabel(s){
     if(s==='bank')return'🏦 Conta Banco';
     return cardNames[s]||`💳 Cartão ...${s.replace('card_','')}`;
