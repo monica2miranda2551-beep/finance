@@ -765,160 +765,107 @@ async function parseBOACheckingPDF(buffer,filename){
   document.getElementById('import-results').appendChild(loadEl);
   try{
     const pdf=await pdfjsLib.getDocument({data:buffer}).promise;
-    // Extract all text items with position, grouped by page then sorted top-to-bottom, left-to-right
-    const allItems=[];
+    // Group text items by Y coordinate per page → one string per visual row
+    const allLines=[];
     for(let pn=1;pn<=pdf.numPages;pn++){
       const page=await pdf.getPage(pn);
       const tc=await page.getTextContent();
-      // Group items by Y coordinate (rounded to nearest 3pt to merge same-line items)
       const byY=new Map();
       for(const item of tc.items){
         if(!item.str.trim())continue;
-        const y=Math.round(item.transform[5]/3)*3;
-        const x=item.transform[4];
+        const y=Math.round(item.transform[5]/2)*2;
         if(!byY.has(y))byY.set(y,[]);
-        byY.get(y).push({x,str:item.str.trim(),y});
+        byY.get(y).push({x:item.transform[4],str:item.str.trim()});
       }
-      // Sort rows top-to-bottom (descending Y in PDF coords)
-      const rows=[...byY.entries()].sort((a,b)=>b[0]-a[0]);
-      for(const [y,items] of rows){
-        const sorted=items.sort((a,b)=>a.x-b.x);
-        // Detect if this row has a date-like token on the left and amount on the right
-        for(const item of sorted){
-          allItems.push({x:item.x,y,str:item.str,page:pn});
-        }
-      }
+      [...byY.entries()].sort((a,b)=>b[0]-a[0]).forEach(([,items])=>{
+        const line=items.sort((a,b)=>a.x-b.x).map(i=>i.str).join(' ').trim();
+        if(line)allLines.push(line);
+      });
     }
 
-    // Find account last 4 and statement year from text
+    // Find account last 4 and statement year
     let acctLast4=null,stmtYear=null,stmtMonth=null;
     const MO={january:1,february:2,march:3,april:4,may:5,june:6,july:7,august:8,september:9,october:10,november:11,december:12};
-    const fullText=allItems.map(i=>i.str).join(' ');
-    const acctM=fullText.match(/\d{4}\s+\d{4}\s+(\d{4})/);
-    if(acctM)acctLast4=acctM[1];
-    const yearM=fullText.match(/to\s+\w+\s+\d+,\s+(\d{4})/i);
-    if(yearM)stmtYear=parseInt(yearM[1]);
-    const monM=fullText.match(/to\s+(\w+)\s+\d+,\s+\d{4}/i);
-    if(monM)stmtMonth=MO[monM[1].toLowerCase()]||null;
+    for(const line of allLines){
+      if(!acctLast4){const m=line.match(/\d{4}\s+\d{4}\s+(\d{4})/);if(m)acctLast4=m[1];}
+      if(!stmtYear){const m=line.match(/to\s+\w+\s+\d+,\s+(\d{4})/i);if(m)stmtYear=parseInt(m[1]);}
+      if(!stmtMonth){const m=line.match(/to\s+(\w+)\s+\d+,\s+\d{4}/i);if(m)stmtMonth=MO[m[1].toLowerCase()]||null;}
+    }
     acctLast4=acctLast4||'4659';
     stmtYear=stmtYear||new Date().getFullYear();
     stmtMonth=stmtMonth||new Date().getMonth()+1;
 
-    // ── State-machine parser ──────────────────────────────────────
-    // pdfjsLib extracts: date on one "cell", description on another, amount on another.
-    // We use a state machine: look for a date token, collect description tokens,
-    // then grab the amount token. Section headers control income vs expense.
-    const dateRe=/^(\d{1,2})\/(\d{2})\/(\d{2})$/;
-    const amtRe=/^-?\$?[\d,]+\.\d{2}$/;
-    const sectionHeaders={
+    // Section detection
+    const sectionMap={
       'deposits and other additions':'income',
       'atm and debit card subtractions':'expense',
       'other subtractions':'expense',
       'service fees':'expense',
       'withdrawals and other subtractions':'expense',
     };
-    const skipPhrases=['total deposits','total atm','total other','total service','ending balance',
-      'beginning balance','important information','bank deposit accounts','date description amount',
-      'date','description','amount','continued on the next page','page ','pull:',
-      'take your security','check your security','bofa.com','mobile banking requires',
-      'when you use the qrc','vehicle financing','bank of america n.a','member fdic',
-      '© 20','braille','footnote','note your ending','overdraft item fee for activity',
-      'total for this period','total year-to-date','total overdraft','total nsf'];
+    // Lines to skip entirely
+    const skipRe=/^(total |date\s+desc|page \d|pull:|monica |continued on|take your|check your|bofa\.com|mobile banking|when you use|vehicle fin|bank of america n|member fdic|© 20|braille|note your|overdraft item fee|total for this|total year|total overdraft|total nsf)/i;
+
+    // Transaction regex: MM/DD/YY <desc> <amount> [optional trailing garbage]
+    // Amount can be anywhere after the date+desc — we grab the LAST amount token
+    const datePfx=/^(\d{1,2})\/(\d{2})\/(\d{2})\s+/;
+    const amtToken=/-?\$?[\d,]+\.\d{2}/g;
 
     let section='';
     const seen=new Set(txs.map(t=>`${t.date}|${t.desc}|${Math.round(t.amount*100)}`));
     const newTxs=[];
 
-    // Re-group allItems into logical rows by Y (same as extraction above, but now per-row)
-    // Then process row by row
-    const rowMap=new Map();
-    for(const item of allItems){
-      const k=`${item.page}_${item.y}`;
-      if(!rowMap.has(k))rowMap.set(k,{y:item.y,page:item.page,items:[]});
-      rowMap.get(k).items.push(item);
-    }
-    const rows=[...rowMap.values()].sort((a,b)=>a.page-b.page||b.y-a.y);
-    const rowTexts=rows.map(r=>r.items.sort((a,b)=>a.x-b.x).map(i=>i.str).join(' ').trim());
-
-    // State machine
-    let pendingDate=null,pendingDescs=[],pendingSec='';
-    const flush=()=>{
-      if(!pendingDate||!pendingDescs.length)return;
-      // last token in pendingDescs might be the amount
-      let amtStr=null,descParts=[];
-      // find the amount: it's the last token matching amtRe
-      for(let i=pendingDescs.length-1;i>=0;i--){
-        if(amtRe.test(pendingDescs[i].replace(/,/g,'').replace('$',''))||amtRe.test(pendingDescs[i])){
-          amtStr=pendingDescs[i];
-          descParts=pendingDescs.slice(0,i);
-          break;
-        }
-      }
-      if(!amtStr){pendingDate=null;pendingDescs=[];return;}
-      const rawAmt=parseFloat(amtStr.replace(/[$,]/g,''));
-      if(isNaN(rawAmt)||rawAmt===0){pendingDate=null;pendingDescs=[];return;}
-      const rawDesc=descParts.join(' ').trim();
-      if(!rawDesc){pendingDate=null;pendingDescs=[];return;}
-      const dl=rawDesc.toLowerCase();
-      if(dl.includes('online banking transfer to sav')||dl.includes('online banking transfer to chk')){pendingDate=null;pendingDescs=[];return;}
-      const amount=Math.abs(rawAmt);
-      const type=pendingSec==='income'?'income':'expense';
-      const cat=type==='income'?classifyIncome(rawDesc):classify(rawDesc);
-      const cleanedDesc=cleanDesc(rawDesc,cat);
-      const key=`${pendingDate}|${cleanedDesc}|${Math.round(amount*100)}`;
-      if(!seen.has(key)){
-        seen.add(key);
-        newTxs.push({id:uid(),date:pendingDate,desc:cleanedDesc,rawDesc,amount,cat,override:false,source:`card_${acctLast4}`,type});
-      }
-      pendingDate=null;pendingDescs=[];
-    };
-
-    for(const rowText of rowTexts){
-      const ll=rowText.toLowerCase().trim();
+    console.log('ALL LINES:', allLines.slice(0,60));
+    for(const line of allLines){
+      const ll=line.toLowerCase().trim();
       if(!ll)continue;
 
-      // Check section headers
-      let isSectionHeader=false;
-      for(const [key,val] of Object.entries(sectionHeaders)){
-        if(ll===key||ll.startsWith(key+' -')||ll.includes(key)){
-          flush();
-          section=val;
-          isSectionHeader=true;
-          break;
+      // Detect section change
+      let isSec=false;
+      for(const[key,val] of Object.entries(sectionMap)){
+        if(ll===key||ll.startsWith(key+' -')||ll.startsWith(key)){
+          section=val;isSec=true;break;
         }
       }
-      if(isSectionHeader)continue;
+      if(isSec)continue;
       if(!section)continue;
+      if(skipRe.test(ll))continue;
 
-      // Skip noise lines
-      if(skipPhrases.some(s=>ll.startsWith(s)||ll===s))continue;
-      if(/^\$[\d,]+\.\d{2}$/.test(ll))continue; // totals like $13,104.29
-      if(/^\d{4}\s+\d{4}\s+\d{4}/.test(ll))continue; // account number header
+      // Must start with a date
+      if(!datePfx.test(line))continue;
 
-      // Check if this row is a date (MM/DD/YY standalone)
-      const tokens=rowText.trim().split(/\s+/);
-      if(tokens.length===1&&dateRe.test(tokens[0])){
-        flush();
-        const [mo,dy,yr]=tokens[0].split('/').map(Number);
-        const fullYear=2000+yr;
-        pendingDate=`${fullYear}-${String(mo).padStart(2,'0')}-${String(dy).padStart(2,'0')}`;
-        pendingDescs=[];
-        pendingSec=section;
-        continue;
-      }
+      // Extract all amount-like tokens from the line
+      const amounts=[...line.matchAll(amtToken)].map(m=>m[0]);
+      if(!amounts.length)continue;
 
-      // If we have a pending date, accumulate description/amount tokens
-      if(pendingDate){
-        // Check if entire row is an amount
-        if(tokens.length===1&&(amtRe.test(tokens[0])||amtRe.test(tokens[0].replace(/,/g,'')))){
-          pendingDescs.push(tokens[0]);
-          flush();
-        }else{
-          pendingDescs.push(rowText.trim());
-        }
-      }
+      // The transaction amount is the LAST amount token
+      const amtStr=amounts[amounts.length-1];
+      const rawAmt=parseFloat(amtStr.replace(/[$,]/g,''));
+      if(isNaN(rawAmt)||rawAmt===0)continue;
+
+      // Description = everything between date and last amount occurrence
+      const dateMatch=line.match(datePfx);
+      const afterDate=line.slice(dateMatch[0].length);
+      const lastAmtIdx=afterDate.lastIndexOf(amtStr);
+      let rawDesc=afterDate.slice(0,lastAmtIdx).trim();
+      // Remove trailing noise after last amount
+      if(!rawDesc)rawDesc=afterDate.trim();
+
+      const dl=rawDesc.toLowerCase();
+      if(dl.includes('online banking transfer to sav')||dl.includes('online banking transfer to chk'))continue;
+
+      const[,mo,dy,yr]=line.match(datePfx);
+      const fullYear=2000+parseInt(yr);
+      const date=`${fullYear}-${mo.padStart(2,'0')}-${dy.padStart(2,'0')}`;
+      const amount=Math.abs(rawAmt);
+      const type=section==='income'?'income':'expense';
+      const cat=type==='income'?classifyIncome(rawDesc):classify(rawDesc);
+      const cleanedDesc=cleanDesc(rawDesc,cat);
+      const key=`${date}|${cleanedDesc}|${Math.round(amount*100)}`;
+      if(seen.has(key))continue;
+      seen.add(key);
+      newTxs.push({id:uid(),date,desc:cleanedDesc,rawDesc,amount,cat,override:false,source:`card_${acctLast4}`,type});
     }
-    flush();
 
     txs.push(...newTxs);
     txs.sort((a,b)=>b.date.localeCompare(a.date));
