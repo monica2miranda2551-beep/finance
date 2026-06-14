@@ -899,11 +899,13 @@ async function parseBOACheckingPDF(buffer,filename){
 async function detectAndParsePDF(buffer,filename){
   if(typeof pdfjsLib==='undefined'){showResult('Suporte a PDF não disponível.','error');return;}
   try{
-    const pdf=await pdfjsLib.getDocument({data:buffer}).promise;
+    // Copy buffer before detection — pdfjsLib.getDocument() consumes/detaches the ArrayBuffer
+    const bufCopy=buffer.slice(0);
+    const pdf=await pdfjsLib.getDocument({data:bufCopy}).promise;
     const page=await pdf.getPage(1);
     const tc=await page.getTextContent();
     const text=tc.items.map(i=>i.str).join(' ').toLowerCase();
-    // Checking statements have "adv plus banking" or "deposits and other additions" or "checking"
+    // Checking statements have "adv plus banking" or "deposits and other additions"
     if(text.includes('adv plus banking')||text.includes('deposits and other additions')||text.includes('checking account')){
       return parseBOACheckingPDF(buffer,filename);
     }else{
