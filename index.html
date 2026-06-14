@@ -438,10 +438,19 @@ function cleanDesc(desc, cat){
     if(m){const name=m[1].trim().split(' ').map(w=>w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(' ');return 'Zelle de '+name;}
   }
   if(cat==='zelle'){
-    const m=desc.match(/zelle payment to\s+([A-Za-z ]+?)(?:\s+Conf#|\s*$)/i);
+    const m=desc.match(/zelle payment to\s+([A-Za-z ,]+?)(?:\s+for [^;]+)?(?:\s*Conf#|\s*$)/i);
     if(m){const name=m[1].trim().split(' ').map(w=>w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(' ');return 'Zelle para '+name;}
   }
-  return desc;
+  // Clean ACH/bank entries: strip DES:/ID:/INDN:/CO ID: suffixes
+  let d=desc.replace(/\s+DES:\S+\s+ID:\S+\s+INDN:\S.*$/i,'').trim();
+  d=d.replace(/\s+CO\s+ID:\S.*$/i,'').trim();
+  d=d.replace(/\s+PPD\s+PMT\s+INFO:.*$/i,'').trim();
+  d=d.replace(/\s+(WEB|PPD)\s*$/i,'').trim();
+  // Clean MOBILE PURCHASE/CHECKCARD/PURCHASE prefix + date code
+  d=d.replace(/^(MOBILE PURCHASE|CHECKCARD|PURCHASE)\s+\d{4}\s+/i,'').trim();
+  // Remove long numeric ref at end
+  d=d.replace(/\s+\d{15,}$/, '').trim();
+  return d||desc;
 }
 
 // ─── INCOME CATEGORIES ─────────────────────────────────────────
@@ -747,6 +756,164 @@ async function parseBOACreditCardPDF(buffer,filename){
   }
 }
 
+// ─── PDF PARSING (Bank of America Checking Account) ─────────────
+async function parseBOACheckingPDF(buffer,filename){
+  if(typeof pdfjsLib==='undefined'){showResult('Suporte a PDF não disponível. Recarregue a página.','error');return;}
+  const loadEl=document.createElement('div');
+  loadEl.className='bg-blue-50 border border-blue-100 rounded-xl p-3 text-sm text-blue-800 fade-in';
+  loadEl.textContent='Lendo extrato de conta corrente '+filename+'...';
+  document.getElementById('import-results').appendChild(loadEl);
+  try{
+    const pdf=await pdfjsLib.getDocument({data:buffer}).promise;
+    const allLines=[];
+    for(let pn=1;pn<=pdf.numPages;pn++){
+      const page=await pdf.getPage(pn);
+      const tc=await page.getTextContent();
+      const byY=new Map();
+      for(const item of tc.items){
+        if(!item.str.trim())continue;
+        const y=Math.round(item.transform[5]/2)*2;
+        if(!byY.has(y))byY.set(y,[]);
+        byY.get(y).push({x:item.transform[4],str:item.str.trim()});
+      }
+      [...byY.entries()].sort((a,b)=>b[0]-a[0]).forEach(([,items])=>{
+        const line=items.sort((a,b)=>a.x-b.x).map(i=>i.str).join(' ');
+        if(line.trim())allLines.push(line.trim());
+      });
+    }
+
+    // Find account last 4 and statement year
+    let acctLast4=null, stmtYear=null, stmtMonth=null;
+    for(const line of allLines){
+      if(!acctLast4){
+        const m=line.match(/Account\s*#?\s*[\d\s]+(\d{4})\s*$/i)||line.match(/account\s+number[:\s]+[\d\s]+(\d{4})/i);
+        if(m)acctLast4=m[1];
+      }
+      if(!stmtYear){
+        // "for April 17, 2026 to May 14, 2026" or "April 17, 2026 to May 14, 2026"
+        const m=line.match(/to\s+\w+\s+\d+,\s+(\d{4})/i)||line.match(/(\d{4})\s*$/);
+        if(m&&parseInt(m[1])>2000){stmtYear=parseInt(m[1]);}
+      }
+      if(!stmtMonth){
+        const m=line.match(/to\s+(\w+)\s+\d+,\s+\d{4}/i);
+        if(m){const MO={january:1,february:2,march:3,april:4,may:5,june:6,july:7,august:8,september:9,october:10,november:11,december:12};stmtMonth=MO[m[1].toLowerCase()]||null;}
+      }
+    }
+    if(!acctLast4){
+      // Try header line: "Account # 8981 3221 4659"
+      for(const line of allLines){
+        const m=line.match(/\d{4}\s+\d{4}\s+(\d{4})/);
+        if(m){acctLast4=m[1];break;}
+      }
+    }
+    acctLast4=acctLast4||'4659';
+    stmtYear=stmtYear||new Date().getFullYear();
+    stmtMonth=stmtMonth||new Date().getMonth()+1;
+
+    // Parse transactions
+    // Sections: deposits=income, ATM/debit/other/fees=expense
+    // Date format in PDF: MM/DD/YY  e.g. 04/24/26
+    const dateRe=/^(\d{1,2})\/(\d{2})\/(\d{2})\s+(.+?)\s+([\-]?\$?[\d,]+\.\d{2})$/;
+    const dateStartRe=/^(\d{1,2})\/(\d{2})\/(\d{2})\s+/;
+    const amtRe=/([-]?\$?[\d,]+\.\d{2})$/;
+
+    let section=''; // 'income' | 'expense' | 'skip'
+    const seen=new Set(txs.map(t=>`${t.date}|${t.desc}|${Math.round(t.amount*100)}`));
+    const newTxs=[];
+
+    // Merge continuation lines: a transaction may span 2 lines in the PDF
+    // Strategy: collect lines, if a line starts with a date it's a new tx; otherwise append to prev
+    const txLines=[];
+    let cur=null;
+    const sectionHeaders={
+      'deposits and other additions':'income',
+      'atm and debit card subtractions':'expense',
+      'other subtractions':'expense',
+      'service fees':'expense',
+      'withdrawals and other subtractions':'expense',
+    };
+    const skipHeaders=['important information','account summary','continued on','total deposits','total atm','total other','total service','ending balance','beginning balance'];
+
+    for(const line of allLines){
+      const ll=line.toLowerCase();
+      // Detect section
+      let isSection=false;
+      for(const [key,val] of Object.entries(sectionHeaders)){
+        if(ll.includes(key)){section=val;isSection=true;break;}
+      }
+      if(isSection)continue;
+      if(skipHeaders.some(s=>ll.startsWith(s)||ll.includes(s))){continue;}
+      if(!section)continue;
+
+      if(dateStartRe.test(line)){
+        if(cur)txLines.push({...cur,section});
+        cur={line,section};
+      }else if(cur){
+        // continuation line — but ignore if it looks like a page header or noise
+        if(ll.startsWith('page ')||ll.startsWith('monica ')||ll.startsWith('pull:'))continue;
+        cur.line=cur.line+' '+line;
+      }
+    }
+    if(cur)txLines.push({...cur,section});
+
+    for(const {line,section:sec} of txLines){
+      const m=line.match(/^(\d{1,2})\/(\d{2})\/(\d{2})\s+(.*?)\s+([-]?\$?[\d,]+\.\d{2})$/);
+      if(!m)continue;
+      const [,mo,dy,yr,rawDesc,amtStr]=m;
+      const fullYear=2000+parseInt(yr);
+      const date=`${fullYear}-${mo.padStart(2,'0')}-${dy.padStart(2,'0')}`;
+      const rawAmt=parseFloat(amtStr.replace(/[$,]/g,''));
+      if(isNaN(rawAmt)||rawAmt===0)continue;
+
+      const desc=rawDesc.trim();
+      const dl=desc.toLowerCase();
+
+      // Skip internal transfers to savings/checking, and card payment rows already covered
+      if(dl.includes('online banking transfer to sav')||dl.includes('online banking transfer to chk'))continue;
+
+      const amount=Math.abs(rawAmt);
+      const type=sec==='income'?'income':'expense';
+      const cat=type==='income'?classifyIncome(desc):classify(desc);
+      const cleanedDesc=cleanDesc(desc,cat);
+      const key=`${date}|${cleanedDesc}|${Math.round(amount*100)}`;
+      if(seen.has(key))continue;
+      seen.add(key);
+      newTxs.push({id:uid(),date,desc:cleanedDesc,rawDesc:desc,amount,cat,override:false,source:`card_${acctLast4}`,type});
+    }
+
+    txs.push(...newTxs);
+    txs.sort((a,b)=>b.date.localeCompare(a.date));
+    save();
+    loadEl.remove();
+    const inc=newTxs.filter(t=>t.type==='income').length;
+    const exp=newTxs.filter(t=>t.type==='expense').length;
+    showResult(`<strong>${newTxs.length} transações</strong> da conta corrente <strong>...${acctLast4}</strong> importadas · ${inc} receitas · ${exp} despesas`,'ok',true);
+  }catch(e){
+    loadEl.remove();
+    showResult('Erro ao ler PDF da conta corrente: '+e.message,'error');
+    console.error(e);
+  }
+}
+
+// Detect whether a PDF is a checking statement or credit card statement
+async function detectAndParsePDF(buffer,filename){
+  if(typeof pdfjsLib==='undefined'){showResult('Suporte a PDF não disponível.','error');return;}
+  try{
+    const pdf=await pdfjsLib.getDocument({data:buffer}).promise;
+    const page=await pdf.getPage(1);
+    const tc=await page.getTextContent();
+    const text=tc.items.map(i=>i.str).join(' ').toLowerCase();
+    // Checking statements have "adv plus banking" or "deposits and other additions" or "checking"
+    if(text.includes('adv plus banking')||text.includes('deposits and other additions')||text.includes('checking account')){
+      return parseBOACheckingPDF(buffer,filename);
+    }else{
+      return parseBOACreditCardPDF(buffer,filename);
+    }
+  }catch(e){
+    return parseBOACreditCardPDF(buffer,filename);
+  }
+}
+
 // ─── FILE HANDLING ──────────────────────────────────────────────
 function handleDrop(e){
   e.preventDefault();
@@ -758,7 +925,7 @@ function handleFileInput(files){
   for(const file of files){
     if(file.name.toLowerCase().endsWith('.pdf')){
       const reader=new FileReader();
-      reader.onload=ev=>parseBOACreditCardPDF(ev.target.result,file.name);
+      reader.onload=ev=>detectAndParsePDF(ev.target.result,file.name);
       reader.readAsArrayBuffer(file);
     }else{
       const reader=new FileReader();
